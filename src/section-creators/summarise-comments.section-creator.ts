@@ -9,7 +9,7 @@ import { Utils } from '../services/utils';
 import { IConfig } from '../interfaces/config.interface';
 import { IInputs } from '../interfaces/inputs.interface';
 import { IIssueComment } from '../interfaces/issue-comment.interface';
-import { encode } from 'gpt-tokenizer';
+import { encode, decode } from 'gpt-tokenizer';
 
 export class SummariseCommentsSectionCreator implements ISectionCreator {
     isAddSection(inputs: IInputs, config: Partial<IConfig>) {
@@ -19,27 +19,34 @@ export class SummariseCommentsSectionCreator implements ISectionCreator {
             !!config.sections.commentSummary.title
         );
     }
-    
-    async generatePromptChunks(prompt: string, maxTokens: number) {
-        const promptTokens = encode(prompt)
+
+    // Return a list of strings that have been chunked up to maxTokens.
+    // maxTokens is the number of tokens to generate for the completion. We need to take into account
+    // maxmimum allowable number of tokens that is allowed for the model and subtract
+    // (prompt.length + maxTokens). Most models do 4096 so we will use that as a default.
+    async generatePromptChunks(prompt_context: string, maxTokens: number) {
+        const contextTokens = encode(prompt_context);
         const chunks = [];
+        const MODEL_MAX_TOKENS = 4096;
+        let chunk: number[] = [];
 
-        let currentChunk = '';
+        const chunkSize = MODEL_MAX_TOKENS - maxTokens;
 
-        for (const token of promptTokens) {
-            if ((currentChunk + ' ' + token).length <= maxTokens) {
-                currentChunk += ' ' + token;
+        for (const token of contextTokens) {
+            if (chunk.length < chunkSize) {
+                chunk.push(token);
             } else {
-                chunks.push(currentChunk.trim());
-                currentChunk = token;
+                chunks.push(chunk);
+                chunk = [token];
             }
         }
 
-        if (currentChunk) {
-            chunks.push(currentChunk.trim());
+        // Add the last chunk if it's not empty
+        if (chunk.length > 0) {
+            chunks.push(chunk);
         }
 
-        return chunks;
+        return chunks.map((chunk) => decode(chunk));
     }
 
     async createSection(
@@ -66,20 +73,33 @@ export class SummariseCommentsSectionCreator implements ISectionCreator {
             })
             .filter((comment) => comment.author !== 'github-actions[bot]');
 
+        // I think we need to think about splitting up the prompt into chunks here. Each chunk should probably
+        // include the title and body of the issue and then a chunk for each comment. We can then merge all the
+        // summarization data into one message. Each data chunk is separated by ---
         const prompt = Utils.resolveTemplate(config?.sections?.commentSummary?.prompt, {
             issueTitle: issue.title,
             issueBody: issue.body,
-            issueComments: JSON.stringify(issueComments),
+            issueComments: '',
         });
 
-        const promptChunks = await this.generatePromptChunks(prompt, inputs.maxTokens / 2);
+        // length of prompt without issue comments
+        const promptLength = encode(prompt).length;
         const messageParts = ['Merge all the summarization data into one message. Each data chunk is separated by ---'];
+        const commentChunks = await this.generatePromptChunks(
+            JSON.stringify(issueComments),
+            inputs.maxTokens - promptLength,
+        );
 
-        for (const chunk of promptChunks) {
+        for (const commentChunk of commentChunks) {
+            const prompt = Utils.resolveTemplate(config?.sections?.commentSummary?.prompt, {
+                issueTitle: issue.title,
+                issueBody: issue.body,
+                issueComments: commentChunk,
+            });
             const result = (
                 await openaiClient.createCompletion({
                     model: inputs.model,
-                    prompt: chunk,
+                    prompt: prompt,
                     max_tokens: inputs.maxTokens,
                 })
             ).data.choices[0].text;
@@ -104,4 +124,3 @@ export class SummariseCommentsSectionCreator implements ISectionCreator {
         ];
     }
 }
-
